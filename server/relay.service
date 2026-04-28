@@ -1,0 +1,25 @@
+[Unit]
+Description=Fastly VLESS-WS Relay
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/relay/server
+Environment=NODE_ENV=production
+Environment=PORT=8080
+Environment=TARGET_DOMAIN=https://cpanel.nx.plus:2096
+Environment=WS_PATH=/cpess
+Environment=ALLOWED_HOST=myfastlydomain.com
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+User=www-data
+Group=www-data
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
