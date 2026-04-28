@@ -1,48 +1,62 @@
+export const config = { runtime: "edge" };
+
 const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
 const STRIP_HEADERS = new Set([
-  "host", "connection", "keep-alive",
-  "proxy-authenticate", "proxy-authorization",
-  "te", "trailer", "transfer-encoding", "upgrade",
-  "forwarded", "x-forwarded-host",
-  "x-forwarded-proto", "x-forwarded-port",
+  "host",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "forwarded",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
 ]);
 
-export default async function handler(req, res) {
+export default async function handler(req) {
   if (!TARGET_BASE) {
-    return res.status(500).send("Misconfigured: TARGET_DOMAIN is not set");
+    return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
   }
 
   try {
-    const pathStart = req.url.indexOf("/", 1);
-    const targetUrl = pathStart === -1
-      ? TARGET_BASE + "/"
-      : TARGET_BASE + req.url.slice(pathStart);
+    const pathStart = req.url.indexOf("/", 8);
+    const targetUrl =
+      pathStart === -1 ? TARGET_BASE + "/" : TARGET_BASE + req.url.slice(pathStart);
 
-    const out = {};
-    for (const [k, v] of Object.entries(req.headers)) {
+    const out = new Headers();
+    let clientIp = null;
+    for (const [k, v] of req.headers) {
       if (STRIP_HEADERS.has(k)) continue;
       if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip" || k === "x-forwarded-for") continue;
-      out[k] = v;
+      if (k === "x-real-ip") {
+        clientIp = v;
+        continue;
+      }
+      if (k === "x-forwarded-for") {
+        if (!clientIp) clientIp = v;
+        continue;
+      }
+      out.set(k, v);
     }
-    if (req.headers["x-real-ip"]) {
-      out["x-forwarded-for"] = req.headers["x-real-ip"];
-    }
+    if (clientIp) out.set("x-forwarded-for", clientIp);
 
-    const response = await fetch(targetUrl, {
-      method: req.method,
+    const method = req.method;
+    const hasBody = method !== "GET" && method !== "HEAD";
+
+    return await fetch(targetUrl, {
+      method,
       headers: out,
-      body: req.method !== "GET" && req.method !== "HEAD" ? req : undefined,
+      body: hasBody ? req.body : undefined,
+      duplex: "half",
       redirect: "manual",
     });
-
-    res.status(response.status);
-    response.headers.forEach((v, k) => res.setHeader(k, v));
-    const buffer = await response.arrayBuffer();
-    res.send(Buffer.from(buffer));
   } catch (err) {
     console.error("relay error:", err);
-    res.status(502).send("Bad Gateway: Tunnel Failed");
+    return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
   }
 }
