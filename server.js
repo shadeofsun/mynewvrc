@@ -1,39 +1,14 @@
 /*
- * VLESS + WebSocket relay (origin server, sits behind Fastly CDN)
- *
- * Flow:
- *   xray client ──TLS──> python.com:443  (Fastly edge)
- *                Host: myfastlydomain.com
- *                Upgrade: websocket, Path: /cpess
- *           └─> Fastly routes by Host header to your origin (this server)
- *           └─> this server bridges the WS to TARGET_DOMAIN over wss://
+ * VLESS + WebSocket relay (origin server, sits behind Fastly CDN).
  *
  * Required env:
- *   TARGET_DOMAIN  e.g. https://cpanel.nx.plus:2096   (where the real VLESS-WS server lives)
- *
+ *   TARGET_DOMAIN    e.g. https://cpanel.nx.plus:2096
  * Optional env:
- *   PORT           default 8080
- *   WS_PATH        if set, only this path accepts upgrade (e.g. /cpess). empty = any path
- *   ALLOWED_HOST   if set, Host header must match (e.g. myfastlydomain.com)
- *   TARGET_INSECURE  "1" to skip TLS cert verification on target
- *   IDLE_TIMEOUT_MS  default 600000 (10 min)
- *
- * Fastly checklist (important):
- *   1. Enable "WebSocket Passthrough" on the service (Fastly support feature flag).
- *   2. Configure backend (origin) pointing at this server's host:port.
- *      - If origin is plain HTTP: backend "Enable SSL" = off.
- *      - Recommended: front this server with Caddy/Nginx terminating HTTPS,
- *        so traffic Fastly <-> origin is also encrypted.
- *   3. Increase backend idle timeout (between_bytes_timeout / first_byte_timeout)
- *      to e.g. 600s so long-lived WS sessions aren't cut.
- *   4. Set the host you give users (myfastlydomain.com) as a domain on the service.
- *
- * Deploy (systemd):
- *   sudo apt install nodejs npm
- *   cd /opt && git clone https://github.com/shadeofsun/mynewvrc.git relay && cd relay/server
- *   npm install --omit=dev
- *   TARGET_DOMAIN=https://cpanel.nx.plus:2096 WS_PATH=/cpess \
- *     ALLOWED_HOST=myfastlydomain.com PORT=8080 node server.js
+ *   PORT             default 8080
+ *   WS_PATH          only this path accepts upgrade (e.g. /cpess). empty = any
+ *   ALLOWED_HOST     Host header must match (e.g. myfastlydomain.com). empty = any
+ *   TARGET_INSECURE  "1" to skip TLS verification on target
+ *   IDLE_TIMEOUT_MS  default 600000
  */
 
 import http from "node:http";

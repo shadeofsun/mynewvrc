@@ -1,7 +1,17 @@
 {
-  "name": "vercel-xhttp-relay",
+  "name": "fastly-vless-ws-relay",
   "version": "1.0.0",
-  "description": "Edge-runtime XHTTP relay for Xray/V2Ray on Vercel",
   "private": true,
-  "license": "MIT"
+  "type": "module",
+  "description": "WebSocket relay deployed behind Fastly that forwards VLESS-WS traffic to TARGET_DOMAIN",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
