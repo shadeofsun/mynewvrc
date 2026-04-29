@@ -49,6 +49,8 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
 
     nodeRes.statusCode = response.status;
     for (const [k, v] of response.headers) {
+      const lk = k.toLowerCase();
+      if (lk === "alt-svc") continue; // prevent client switching to HTTP/3
       try { nodeRes.setHeader(k, v); } catch {}
     }
 
