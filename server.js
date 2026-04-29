@@ -39,7 +39,6 @@ const STRIP_RES = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade",
   "x-cache", "x-cache-hits", "age", "via",
-  "content-encoding", "content-length",
 ]);
 
 function clientIpFrom(req) {
