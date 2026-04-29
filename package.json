@@ -1,17 +1,14 @@
 {
-  "name": "fastly-vless-ws-relay",
+  "name": "fastly-xhttp-relay",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "WebSocket relay deployed behind Fastly that forwards VLESS-WS traffic to TARGET_DOMAIN",
+  "description": "HTTP streaming relay for Xray XHTTP transport, deployed behind Fastly",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
   }
 }

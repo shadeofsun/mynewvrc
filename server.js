@@ -1,26 +1,22 @@
 /*
- * VLESS + WebSocket relay (origin server, sits behind Fastly CDN).
+ * HTTP streaming relay for XHTTP (splithttp) transports.
  *
  * Required env:
  *   TARGET_DOMAIN    e.g. https://cpanel.nx.plus:2096
  * Optional env:
  *   PORT             default 8080
- *   WS_PATH          only this path accepts upgrade (e.g. /cpess). empty = any
- *   ALLOWED_HOST     Host header must match (e.g. myfastlydomain.com). empty = any
+ *   ALLOWED_HOST     Host header must match (e.g. travello.one). empty = any
  *   TARGET_INSECURE  "1" to skip TLS verification on target
- *   IDLE_TIMEOUT_MS  default 600000
  */
 
 import http from "node:http";
+import https from "node:https";
 import { URL } from "node:url";
-import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const TARGET_DOMAIN = (process.env.TARGET_DOMAIN || "").trim();
-const WS_PATH = (process.env.WS_PATH || "").trim();
 const ALLOWED_HOST = (process.env.ALLOWED_HOST || "").trim().toLowerCase();
 const TARGET_INSECURE = process.env.TARGET_INSECURE === "1";
-const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || "600000", 10);
 
 if (!TARGET_DOMAIN) {
   console.error("FATAL: TARGET_DOMAIN env var is required");
@@ -28,156 +24,132 @@ if (!TARGET_DOMAIN) {
 }
 
 const TARGET = new URL(TARGET_DOMAIN);
-const TARGET_WS_PROTO = TARGET.protocol === "https:" ? "wss:" : "ws:";
-const TARGET_HOST = TARGET.host; // includes port if non-default
+const TARGET_IS_HTTPS = TARGET.protocol === "https:";
+const TARGET_PORT = TARGET.port
+  ? parseInt(TARGET.port, 10)
+  : (TARGET_IS_HTTPS ? 443 : 80);
+const targetClient = TARGET_IS_HTTPS ? https : http;
 
-// ---- HTTP server: cover/health on plain GETs, upgrade for WS ----
-const server = http.createServer((req, res) => {
-  // Generic camouflage page so probes look harmless.
-  res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" });
-  res.end("ok\n");
-});
+const agent = TARGET_IS_HTTPS
+  ? new https.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 30000,
+      maxSockets: 256,
+      maxFreeSockets: 64,
+      rejectUnauthorized: !TARGET_INSECURE,
+      servername: TARGET.hostname,
+    })
+  : new http.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 30000,
+      maxSockets: 256,
+      maxFreeSockets: 64,
+    });
 
-// noServer mode lets us inspect the request before completing the handshake.
-const wss = new WebSocketServer({
-  noServer: true,
-  perMessageDeflate: false,
-  maxPayload: 64 * 1024 * 1024,
-});
+const STRIP_REQ = new Set([
+  "host", "connection", "keep-alive",
+  "proxy-authenticate", "proxy-authorization",
+  "te", "trailer", "transfer-encoding", "upgrade",
+  "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
+  "fastly-ssl", "fastly-client-ip", "fastly-temp-xff",
+  "x-timer", "x-varnish",
+]);
 
-server.on("upgrade", (req, socket, head) => {
-  try {
-    // Path filter
-    if (WS_PATH) {
-      const pathOnly = (req.url || "").split("?")[0];
-      if (pathOnly !== WS_PATH) {
-        socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-    }
-    // Host header filter (Fastly forwards Host as-is by default)
-    if (ALLOWED_HOST) {
-      const h = String(req.headers.host || "").toLowerCase();
-      if (h !== ALLOWED_HOST) {
-        socket.write("HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-    }
-
-    wss.handleUpgrade(req, socket, head, (ws) => bridge(ws, req));
-  } catch (err) {
-    console.error("upgrade error:", err);
-    try { socket.destroy(); } catch {}
-  }
-});
+const STRIP_RES = new Set([
+  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailer", "transfer-encoding", "upgrade",
+  "x-cache", "x-cache-hits", "age",
+]);
 
 function clientIpFrom(req) {
   return (
     req.headers["fastly-client-ip"] ||
-    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
     req.socket.remoteAddress ||
     ""
   );
 }
 
-function bridge(clientWs, req) {
-  const targetUrl = `${TARGET_WS_PROTO}//${TARGET_HOST}${req.url}`;
+const server = http.createServer((req, res) => {
+  try { req.socket.setNoDelay(true); } catch {}
+  try { res.socket?.setNoDelay(true); } catch {}
+
+  if (ALLOWED_HOST) {
+    const h = String(req.headers.host || "").toLowerCase();
+    if (h !== ALLOWED_HOST) {
+      res.writeHead(421, { "content-type": "text/plain", "cache-control": "no-store" });
+      res.end("misdirected\n");
+      return;
+    }
+  }
+
+  const fwd = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (STRIP_REQ.has(k)) continue;
+    if (k.startsWith("x-vercel-")) continue;
+    fwd[k] = v;
+  }
+  fwd["host"] = TARGET.host;
   const ip = clientIpFrom(req);
+  if (ip) fwd["x-forwarded-for"] = ip;
+  fwd["x-forwarded-proto"] = "https";
 
-  const fwdHeaders = {
-    "user-agent": req.headers["user-agent"] || "Mozilla/5.0",
+  const opts = {
+    method: req.method,
+    host: TARGET.hostname,
+    port: TARGET_PORT,
+    path: req.url,
+    headers: fwd,
+    agent,
   };
-  if (ip) fwdHeaders["x-forwarded-for"] = ip;
-  // Pass through Sec-WebSocket-Protocol if the client sent one
-  const subproto = req.headers["sec-websocket-protocol"];
+  if (TARGET_IS_HTTPS) {
+    opts.servername = TARGET.hostname;
+    opts.rejectUnauthorized = !TARGET_INSECURE;
+  }
 
-  const targetWs = new WebSocket(targetUrl, subproto ? subproto.split(",").map(s => s.trim()) : undefined, {
-    headers: fwdHeaders,
-    servername: TARGET.hostname,           // proper SNI to TARGET
-    rejectUnauthorized: !TARGET_INSECURE,
-    perMessageDeflate: false,
-    handshakeTimeout: 15000,
-  });
-
-  // Buffer client frames that arrive before target socket is OPEN
-  const pending = [];
-  let openedTarget = false;
-  let closed = false;
-  const closeBoth = (code = 1000, reason = "") => {
-    if (closed) return;
-    closed = true;
-    try { clientWs.close(code, reason); } catch {}
-    try { targetWs.close(code, reason); } catch {}
-    try { clientWs.terminate?.(); } catch {}
-    try { targetWs.terminate?.(); } catch {}
-  };
-
-  // Idle timeout — kill stuck sessions
-  let idleTimer = setTimeout(() => closeBoth(1001, "idle"), IDLE_TIMEOUT_MS);
-  const bumpIdle = () => {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => closeBoth(1001, "idle"), IDLE_TIMEOUT_MS);
-  };
-
-  targetWs.on("open", () => {
-    openedTarget = true;
-    for (const { data, isBinary } of pending) {
-      try { targetWs.send(data, { binary: isBinary }); } catch {}
+  const upstream = targetClient.request(opts, (upRes) => {
+    const headers = {};
+    for (const [k, v] of Object.entries(upRes.headers)) {
+      if (STRIP_RES.has(k.toLowerCase())) continue;
+      headers[k] = v;
     }
-    pending.length = 0;
+    headers["cache-control"] = "no-store, no-transform";
+    headers["pragma"] = "no-cache";
+    headers["x-accel-buffering"] = "no";
+
+    res.writeHead(upRes.statusCode || 502, upRes.statusMessage || "", headers);
+    if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+    upRes.pipe(res);
+    upRes.on("error", () => { try { res.destroy(); } catch {} });
   });
 
-  targetWs.on("message", (data, isBinary) => {
-    bumpIdle();
-    if (clientWs.readyState === WebSocket.OPEN) {
-      try { clientWs.send(data, { binary: isBinary }); } catch {}
+  upstream.on("error", (err) => {
+    console.error("upstream error:", err.message);
+    if (!res.headersSent) {
+      res.writeHead(502, { "content-type": "text/plain", "cache-control": "no-store" });
     }
+    try { res.end("bad gateway\n"); } catch {}
   });
 
-  targetWs.on("close", (code, reason) => closeBoth(code || 1000, reason?.toString?.() || ""));
-  targetWs.on("error", (err) => {
-    console.error("target ws error:", err.message);
-    closeBoth(1011, "target error");
-  });
+  req.setTimeout(0);
+  res.setTimeout(0);
 
-  clientWs.on("message", (data, isBinary) => {
-    bumpIdle();
-    if (openedTarget && targetWs.readyState === WebSocket.OPEN) {
-      try { targetWs.send(data, { binary: isBinary }); } catch {}
-    } else {
-      pending.push({ data, isBinary });
-    }
-  });
-  clientWs.on("close", (code, reason) => closeBoth(code || 1000, reason?.toString?.() || ""));
-  clientWs.on("error", (err) => {
-    console.error("client ws error:", err.message);
-    closeBoth(1011, "client error");
-  });
+  req.on("aborted", () => { try { upstream.destroy(); } catch {} });
+  req.on("error", () => { try { upstream.destroy(); } catch {} });
+  res.on("close", () => { try { upstream.destroy(); } catch {} });
 
-  // Keepalive ping (some intermediaries drop silent connections)
-  const ping = setInterval(() => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      try { clientWs.ping(); } catch {}
-    }
-    if (targetWs.readyState === WebSocket.OPEN) {
-      try { targetWs.ping(); } catch {}
-    }
-  }, 30000);
-  const stopPing = () => clearInterval(ping);
-  clientWs.on("close", stopPing);
-  targetWs.on("close", stopPing);
-}
+  req.pipe(upstream);
+});
 
 server.headersTimeout = 0;
 server.requestTimeout = 0;
 server.keepAliveTimeout = 75000;
+server.timeout = 0;
 
 server.listen(PORT, () => {
   console.log(`[relay] listening on :${PORT}`);
-  console.log(`[relay] target = ${TARGET_DOMAIN}  (ws proto: ${TARGET_WS_PROTO})`);
-  if (WS_PATH)      console.log(`[relay] ws path filter = ${WS_PATH}`);
+  console.log(`[relay] target = ${TARGET_DOMAIN}`);
   if (ALLOWED_HOST) console.log(`[relay] allowed host = ${ALLOWED_HOST}`);
 });
 

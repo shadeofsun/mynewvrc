@@ -6,10 +6,8 @@ services:
     restart: unless-stopped
     environment:
       TARGET_DOMAIN: ${TARGET_DOMAIN}
-      WS_PATH: ${WS_PATH:-}
       ALLOWED_HOST: ${ALLOWED_HOST:-}
       TARGET_INSECURE: ${TARGET_INSECURE:-0}
-      IDLE_TIMEOUT_MS: ${IDLE_TIMEOUT_MS:-600000}
       PORT: 8080
     expose:
       - "8080"
