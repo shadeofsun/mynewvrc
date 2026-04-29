@@ -1,5 +1,5 @@
 /*
- * Streaming HTTP relay (mirrors the Vercel Edge version) for Xray XHTTP.
+ * HTTP relay (mirrors the Vercel Edge version) for Xray XHTTP transport.
  *
  * Required env:
  *   TARGET_DOMAIN    e.g. https://cpanel.nx.plus:2096
@@ -21,7 +21,6 @@ if (!TARGET_BASE) {
   console.error("FATAL: TARGET_DOMAIN env var is required");
   process.exit(1);
 }
-
 if (TARGET_INSECURE) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 }
@@ -41,14 +40,13 @@ const STRIP_RES = new Set([
   "x-cache", "x-cache-hits", "age", "via",
 ]);
 
-function clientIpFrom(req) {
-  return (
-    req.headers["fastly-client-ip"] ||
-    req.headers["x-real-ip"] ||
-    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
-    req.socket.remoteAddress ||
-    ""
-  );
+// Heuristic: which requests are streaming downloads (no end), so we MUST stream
+// instead of buffering. Everything else (short POSTs in packet-up) can be
+// buffered, exactly like the Vercel Edge version did.
+function isStreaming(req) {
+  // GET/HEAD bodies don't exist; it's the response that streams (down link).
+  if (req.method === "GET" || req.method === "HEAD") return true;
+  return false;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -66,7 +64,7 @@ const server = http.createServer(async (req, res) => {
 
   const targetUrl = TARGET_BASE + req.url;
 
-  const out = new Headers();
+  const out = {};
   let clientIp = null;
   for (const [k, v] of Object.entries(req.headers)) {
     if (STRIP_REQ.has(k)) continue;
@@ -74,32 +72,36 @@ const server = http.createServer(async (req, res) => {
     if (k === "fastly-client-ip") { clientIp = v; continue; }
     if (k === "x-real-ip") { clientIp = v; continue; }
     if (k === "x-forwarded-for") { if (!clientIp) clientIp = v; continue; }
-    if (Array.isArray(v)) {
-      for (const item of v) out.append(k, item);
-    } else {
-      out.set(k, v);
-    }
+    out[k] = v;
   }
-  if (clientIp) out.set("x-forwarded-for", clientIp);
-  out.set("x-forwarded-proto", "https");
+  if (clientIp) out["x-forwarded-for"] = clientIp;
+  out["x-forwarded-proto"] = "https";
 
   const method = req.method;
   const hasBody = method !== "GET" && method !== "HEAD";
 
-  // Stream the incoming request body straight to fetch (no buffering).
-  const init = {
-    method,
-    headers: out,
-    redirect: "manual",
-  };
+  // Buffer the request body fully (matches Vercel api/index.js behavior).
+  let bodyBuffer = null;
   if (hasBody) {
-    init.body = Readable.toWeb(req);
-    init.duplex = "half";
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      bodyBuffer = Buffer.concat(chunks);
+    } catch (err) {
+      console.error("read body error:", err?.message || err);
+      try { res.destroy(); } catch {}
+      return;
+    }
   }
 
   let upstream;
   try {
-    upstream = await fetch(targetUrl, init);
+    upstream = await fetch(targetUrl, {
+      method,
+      headers: out,
+      body: bodyBuffer,
+      redirect: "manual",
+    });
   } catch (err) {
     console.error("upstream error:", err?.message || err);
     if (!res.headersSent) {
@@ -121,18 +123,26 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(upstream.status);
   if (typeof res.flushHeaders === "function") res.flushHeaders();
 
-  // Stream response body.
-  if (upstream.body) {
+  if (!upstream.body) { res.end(); return; }
+
+  if (isStreaming(req)) {
+    // GETs (download stream): pipe progressively.
     const nodeReadable = Readable.fromWeb(upstream.body);
     nodeReadable.on("error", () => { try { res.destroy(); } catch {} });
     res.on("close", () => { try { nodeReadable.destroy(); } catch {} });
     nodeReadable.pipe(res);
   } else {
-    res.end();
+    // POSTs: buffer full response then send (matches Vercel relay).
+    try {
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.end(buf);
+    } catch (err) {
+      console.error("read response error:", err?.message || err);
+      try { res.destroy(); } catch {}
+    }
   }
 });
 
-// No socket-level timeouts; long-lived streams must survive.
 server.headersTimeout = 0;
 server.requestTimeout = 0;
 server.keepAliveTimeout = 75000;
